@@ -1744,26 +1744,6 @@ fi
 
 dnl XOGON DDX
 
-PKG_CHECK_MODULES(XOGONMODULES, [xau $XDMCP_MODULES ogon-backend1 freerdp2 winpr2 freerdp-server2], [have_xogon=yes], [have_xogon=no])
-AC_MSG_CHECKING([whether to build ogon-backend-x DDX])
-if test "x$XOGON" = xauto; then
-	XOGON="$have_xogon"
-fi
-AC_MSG_RESULT([$XOGON])
-AM_CONDITIONAL(XOGON, [test "x$XOGON" = xyes])
-
-if test "x$XOGON" = xyes; then
-	if test "x$have_xogon" = xno; then
-		AC_MSG_ERROR([ogon-backend-x build explicitly requested, but required modules not found.])
-	fi
-	XOGON_SYS_LIBS="${XSERVERLIBS_LIBS} $XOGONMODULES_LIBS $GLX_SYS_LIBS"
-	XOGON_LIBS="$DBE_LIB $RANDR_LIB $FB_LIB $RENDER_LIB $RECORD_LIB $MI_LIB $PRESENT_LIB $MAIN_LIB $DIX_LIB $OS_LIB $COMPOSITE_LIB $FIXES_LIB $XKB_LIB $XEXT_LIB $XI_LIB $GLX_LIBS $DAMAGE_LIB $MIEXT_DAMAGE_LIB $MIEXT_SYNC_LIB $DRI3_LIB"
-	AC_SUBST([XOGON_LIBS])
-	AC_SUBST([XOGON_SYS_LIBS])
-fi
-
-dnl XOGON DDX
-
 PKG_CHECK_MODULES(XOGONMODULES, [xau $XDMCP_MODULES ogon-backend1 freerdp2 winpr2 freerdp-server2 libsystemd], [have_xogon=yes], [have_xogon=no])
 AC_MSG_CHECKING([whether to build ogon-backend-x DDX])
 if test "x$XOGON" = xauto; then
@@ -2543,7 +2523,6 @@ hw/kdrive/ephyr/Makefile
 hw/kdrive/ephyr/man/Makefile
 hw/kdrive/src/Makefile
 hw/xwayland/Makefile
-hw/xogon/Makefile
 test/Makefile
 xserver.ent
 xorg-server.pc
