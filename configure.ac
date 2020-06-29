@@ -577,7 +577,6 @@ AC_ARG_ENABLE(xorg,    	      AS_HELP_STRING([--enable-xorg], [Build Xorg server
 AC_ARG_ENABLE(dmx,    	      AS_HELP_STRING([--enable-dmx], [Build DMX server (default: no)]), [DMX=$enableval], [DMX=no])
 AC_ARG_ENABLE(xvfb,    	      AS_HELP_STRING([--enable-xvfb], [Build Xvfb server (default: yes)]), [XVFB=$enableval], [XVFB=yes])
 AC_ARG_ENABLE(xnest,   	      AS_HELP_STRING([--enable-xnest], [Build Xnest server (default: auto)]), [XNEST=$enableval], [XNEST=auto])
-AC_ARG_ENABLE(xogon,  	      AS_HELP_STRING([--enable-xogon], [Build ogon x backend server (default: auto)]), [XOGON=$enableval], [XOGON=auto])
 AC_ARG_ENABLE(xquartz,        AS_HELP_STRING([--enable-xquartz], [Build Xquartz server for OS-X (default: auto)]), [XQUARTZ=$enableval], [XQUARTZ=auto])
 AC_ARG_ENABLE(xwayland,       AS_HELP_STRING([--enable-xwayland], [Build Xwayland server (default: auto)]), [XWAYLAND=$enableval], [XWAYLAND=auto])
 AC_ARG_ENABLE(xwayland-eglstream, AS_HELP_STRING([--enable-xwayland-eglstream], [Build Xwayland eglstream support (default: no)]), [XWAYLAND_EGLSTREAM=$enableval], [XWAYLAND_EGLSTREAM=no])
