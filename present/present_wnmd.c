@@ -34,7 +34,7 @@
  *
  * A flip still requires a copy currently, since the original pixmap needs
  * to be updated with the new pixmap content. Just a flip of all windows
- * to the new pixmap is diffcult, because the original pixmap might not be
+ * to the new pixmap is difficult, because the original pixmap might not be
  * controlled by the Xserver.
  *
  */
@@ -138,16 +138,6 @@ present_wnmd_toplvl_pixmap_window(WindowPtr window)
     return w;
 }
 
-void
-present_wnmd_set_abort_flip(WindowPtr window)
-{
-    present_window_priv_ptr window_priv = present_window_priv(window);
-
-    if (!window_priv->flip_pending->abort_flip) {
-        window_priv->flip_pending->abort_flip = TRUE;
-    }
-}
-
 static void
 present_wnmd_flips_stop(WindowPtr window)
 {
@@ -163,7 +153,7 @@ present_wnmd_flips_stop(WindowPtr window)
 }
 
 static void
-present_wnmd_flip_notify(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)
+present_wnmd_flip_notify_vblank(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)
 {
     WindowPtr                   window = vblank->window;
     present_window_priv_ptr     window_priv = present_window_priv(window);
@@ -207,12 +197,6 @@ present_wnmd_event_notify(WindowPtr window, uint64_t event_id, uint64_t ust, uin
     if (!event_id)
         return;
 
-    if (window_priv->flip_active && window_priv->flip_active->event_id == event_id) {
-        /* Notify for active flip, means it is allowed to become idle */
-        window_priv->flip_active->flip_idler = TRUE;
-        return;
-    }
-
     DebugPresent(("\te %" PRIu64 " ust %" PRIu64 " msc %" PRIu64 "\n", event_id, ust, msc));
     xorg_list_for_each_entry(vblank, &window_priv->exec_queue, event_queue) {
         if (event_id == vblank->event_id) {
@@ -222,19 +206,51 @@ present_wnmd_event_notify(WindowPtr window, uint64_t event_id, uint64_t ust, uin
     }
     xorg_list_for_each_entry(vblank, &window_priv->flip_queue, event_queue) {
         if (vblank->event_id == event_id) {
-            if (vblank->queued) {
-                present_wnmd_execute(vblank, ust, msc);
-            } else {
-                assert(vblank->window);
-                present_wnmd_flip_notify(vblank, ust, msc);
-            }
+            assert(vblank->queued);
+            present_wnmd_execute(vblank, ust, msc);
             return;
         }
+    }
+}
+
+void
+present_wnmd_flip_notify(WindowPtr window, uint64_t event_id, uint64_t ust, uint64_t msc)
+{
+    present_window_priv_ptr     window_priv = present_window_priv(window);
+    present_vblank_ptr          vblank;
+
+    xorg_list_for_each_entry(vblank, &window_priv->flip_queue, event_queue) {
+        if (vblank->event_id == event_id) {
+            assert(!vblank->queued);
+            assert(vblank->window);
+            present_wnmd_flip_notify_vblank(vblank, ust, msc);
+            return;
+        }
+    }
+}
+
+void
+present_wnmd_idle_notify(WindowPtr window, uint64_t event_id)
+{
+    present_window_priv_ptr     window_priv = present_window_priv(window);
+    present_vblank_ptr          vblank;
+
+    if (window_priv->flip_active && window_priv->flip_active->event_id == event_id) {
+        /* Active flip is allowed to become idle directly when it becomes unactive again. */
+        window_priv->flip_active->flip_idler = TRUE;
+        return;
     }
 
     xorg_list_for_each_entry(vblank, &window_priv->idle_queue, event_queue) {
         if (vblank->event_id == event_id) {
             present_wnmd_free_idle_vblank(vblank);
+            return;
+        }
+    }
+
+    xorg_list_for_each_entry(vblank, &window_priv->flip_queue, event_queue) {
+        if (vblank->event_id == event_id) {
+            vblank->flip_idler = TRUE;
             return;
         }
     }
@@ -278,7 +294,9 @@ present_wnmd_check_flip(RRCrtcPtr           crtc,
     if (x_off || y_off)
         return FALSE;
 
-    // TODO: Check for valid region?
+    /* Valid area must contain window (for simplicity for now just never flip when one is set). */
+    if (valid)
+        return FALSE;
 
     /* Flip pixmap must have same dimensions as window */
     if (window->drawable.width != pixmap->drawable.width ||
@@ -325,11 +343,11 @@ present_wnmd_check_flip_window (WindowPtr window)
 
     if (flip_pending) {
         if (!present_wnmd_check_flip(flip_pending->crtc, flip_pending->window, flip_pending->pixmap,
-                                flip_pending->sync_flip, NULL, 0, 0, NULL))
-            present_wnmd_set_abort_flip(window);
+                                flip_pending->sync_flip, flip_pending->valid, 0, 0, NULL))
+            window_priv->flip_pending->abort_flip = TRUE;
     } else if (flip_active) {
         if (!present_wnmd_check_flip(flip_active->crtc, flip_active->window, flip_active->pixmap,
-                                     flip_active->sync_flip, NULL, 0, 0, NULL))
+                                     flip_active->sync_flip, flip_active->valid, 0, 0, NULL))
             present_wnmd_flips_stop(window);
     }
 
@@ -337,7 +355,7 @@ present_wnmd_check_flip_window (WindowPtr window)
     xorg_list_for_each_entry(vblank, &window_priv->vblank, window_list) {
         if (vblank->queued && vblank->flip &&
                 !present_wnmd_check_flip(vblank->crtc, window, vblank->pixmap,
-                                         vblank->sync_flip, NULL, 0, 0, &reason)) {
+                                         vblank->sync_flip, vblank->valid, 0, 0, &reason)) {
             vblank->flip = FALSE;
             vblank->reason = reason;
             if (vblank->sync_flip)
@@ -373,7 +391,7 @@ present_wnmd_cancel_flip(WindowPtr window)
     present_window_priv_ptr window_priv = present_window_priv(window);
 
     if (window_priv->flip_pending)
-        present_wnmd_set_abort_flip(window);
+        window_priv->flip_pending->abort_flip = TRUE;
     else if (window_priv->flip_active)
         present_wnmd_flips_stop(window);
 }
