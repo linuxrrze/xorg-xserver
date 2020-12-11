@@ -330,10 +330,8 @@ xwl_screen_post_damage(struct xwl_screen *xwl_screen)
         return;
 
 #ifdef XWL_HAS_GLAMOR
-    if (xwl_screen->glamor &&
-        xwl_screen->egl_backend == &xwl_screen->gbm_backend) {
+    if (xwl_glamor_needs_buffer_flush(xwl_screen))
         glamor_block_handler(xwl_screen->screen);
-    }
 #endif
 
     xorg_list_for_each_entry_safe(xwl_window, next_xwl_window,
@@ -575,6 +573,19 @@ xwl_screen_init(ScreenPtr pScreen, int argc, char **argv)
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-rootless") == 0) {
             xwl_screen->rootless = 1;
+
+            /* Disable the XSS extension on Xwayland rootless.
+             *
+             * Xwayland is just a Wayland client, no X11 screensaver
+             * should be expected to work reliably on Xwayland rootless.
+             */
+#ifdef SCREENSAVER
+            noScreenSaverExtension = TRUE;
+#endif
+            ScreenSaverTime = 0;
+            ScreenSaverInterval = 0;
+            defaultScreenSaverTime = 0;
+            defaultScreenSaverInterval = 0;
         }
         else if (strcmp(argv[i], "-shm") == 0) {
             xwl_screen->glamor = 0;
@@ -623,6 +634,11 @@ xwl_screen_init(ScreenPtr pScreen, int argc, char **argv)
     wl_registry_add_listener(xwl_screen->registry,
                              &registry_listener, xwl_screen);
     xwl_screen_roundtrip(xwl_screen);
+
+    if (!xwl_screen->rootless && !xwl_screen->xdg_wm_base) {
+        ErrorF("missing XDG-WM-Base protocol\n");
+        return FALSE;
+    }
 
     bpc = xwl_screen->depth / 3;
     green_bpc = xwl_screen->depth - 2 * bpc;

@@ -20,10 +20,6 @@
  * OF THIS SOFTWARE.
  */
 
-#ifdef HAVE_XORG_CONFIG_H
-#include <xorg-config.h>
-#endif
-
 #include "present_priv.h"
 
 /*
@@ -41,6 +37,17 @@
 
 static void
 present_wnmd_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc);
+
+static int
+present_wnmd_queue_vblank(ScreenPtr screen,
+                          WindowPtr window,
+                          RRCrtcPtr crtc,
+                          uint64_t event_id,
+                          uint64_t msc)
+{
+    present_screen_priv_ptr screen_priv = present_screen_priv(screen);
+    return (*screen_priv->wnmd_info->queue_vblank) (window, crtc, event_id, msc);
+}
 
 static void
 present_wnmd_create_event_id(present_window_priv_ptr window_priv, present_vblank_ptr vblank)
@@ -158,8 +165,8 @@ present_wnmd_flip_notify_vblank(present_vblank_ptr vblank, uint64_t ust, uint64_
     WindowPtr                   window = vblank->window;
     present_window_priv_ptr     window_priv = present_window_priv(window);
 
-    DebugPresent(("\tn %" PRIu64 " %p %" PRIu64 ": %08" PRIx32 " -> %08" PRIx32 "\n",
-                  vblank->event_id, vblank, vblank->target_msc,
+    DebugPresent(("\tn %" PRIu64 " %p %" PRIu64 " %" PRIu64 ": %08" PRIx32 " -> %08" PRIx32 "\n",
+                  vblank->event_id, vblank, vblank->exec_msc, vblank->target_msc,
                   vblank->pixmap ? vblank->pixmap->drawable.id : 0,
                   vblank->window ? vblank->window->drawable.id : 0));
 
@@ -208,6 +215,14 @@ present_wnmd_event_notify(WindowPtr window, uint64_t event_id, uint64_t ust, uin
         if (vblank->event_id == event_id) {
             assert(vblank->queued);
             present_wnmd_execute(vblank, ust, msc);
+            return;
+        }
+    }
+
+    /* Copies which were executed but need their completion event sent */
+    xorg_list_for_each_entry(vblank, &window_priv->idle_queue, event_queue) {
+        if (vblank->event_id == event_id) {
+            present_execute_post(vblank, ust, msc);
             return;
         }
     }
@@ -286,10 +301,6 @@ present_wnmd_check_flip(RRCrtcPtr           crtc,
     if (!screen_priv->wnmd_info->flip)
         return FALSE;
 
-    /* Can't flip redirected child windows */
-    if (screen->GetWindowPixmap(window) != screen->GetWindowPixmap(toplvl_window))
-        return FALSE;
-
     /* Source pixmap must align with window exactly */
     if (x_off || y_off)
         return FALSE;
@@ -305,6 +316,10 @@ present_wnmd_check_flip(RRCrtcPtr           crtc,
 
     /* Window must be same region as toplevel window */
     if ( !RegionEqual(&window->winSize, &toplvl_window->winSize) )
+        return FALSE;
+
+    /* Can't flip if window clipped by children */
+    if (!RegionEqual(&window->clipList, &window->winSize))
         return FALSE;
 
     /* Ask the driver for permission */
@@ -358,8 +373,6 @@ present_wnmd_check_flip_window (WindowPtr window)
                                          vblank->sync_flip, vblank->valid, 0, 0, &reason)) {
             vblank->flip = FALSE;
             vblank->reason = reason;
-            if (vblank->sync_flip)
-                vblank->requeue = TRUE;
         }
     }
 }
@@ -394,34 +407,6 @@ present_wnmd_cancel_flip(WindowPtr window)
         window_priv->flip_pending->abort_flip = TRUE;
     else if (window_priv->flip_active)
         present_wnmd_flips_stop(window);
-}
-
-static Bool
-present_wnmd_can_window_flip(WindowPtr window)
-{
-    ScreenPtr                   screen = window->drawable.pScreen;
-    present_screen_priv_ptr     screen_priv = present_screen_priv(screen);
-    WindowPtr                   toplvl_window = present_wnmd_toplvl_pixmap_window(window);
-
-    if (!screen_priv)
-        return FALSE;
-
-    if (!screen_priv->wnmd_info)
-        return FALSE;
-
-    /* Check to see if the driver supports flips at all */
-    if (!screen_priv->wnmd_info->flip)
-        return FALSE;
-
-    /* Don't flip redirected windows */
-    if (window->redirectDraw != RedirectDrawNone)
-        return FALSE;
-
-    /* Window must be same region as toplevel window */
-    if ( !RegionEqual(&window->winSize, &toplvl_window->winSize) )
-        return FALSE;
-
-    return TRUE;
 }
 
 /*
@@ -459,6 +444,7 @@ present_wnmd_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)
     vblank->queued = FALSE;
 
     if (vblank->pixmap && vblank->window) {
+        ScreenPtr screen = window->drawable.pScreen;
 
         if (vblank->flip) {
             RegionPtr damage;
@@ -473,10 +459,13 @@ present_wnmd_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)
 
             /* Set update region as damaged */
             if (vblank->update) {
-                damage = vblank->update;
+                damage = RegionDuplicate(vblank->update);
+                /* Translate update region to screen space */
+                assert(vblank->x_off == 0 && vblank->y_off == 0);
+                RegionTranslate(damage, window->drawable.x, window->drawable.y);
                 RegionIntersect(damage, damage, &window->clipList);
             } else
-                damage = &window->clipList;
+                damage = RegionDuplicate(&window->clipList);
 
             /* Try to flip - the vblank is now pending
              */
@@ -484,7 +473,6 @@ present_wnmd_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)
             // ask the driver
             if (present_wnmd_flip(vblank->window, vblank->crtc, vblank->event_id,
                                      vblank->target_msc, vblank->pixmap, vblank->sync_flip, damage)) {
-                ScreenPtr screen = window->drawable.pScreen;
                 WindowPtr toplvl_window = present_wnmd_toplvl_pixmap_window(vblank->window);
                 PixmapPtr old_pixmap = screen->GetWindowPixmap(window);
 
@@ -499,6 +487,7 @@ present_wnmd_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)
 
                 /* Report damage */
                 DamageDamageRegion(&vblank->window->drawable, damage);
+                RegionDestroy(damage);
                 return;
             }
 
@@ -514,9 +503,12 @@ present_wnmd_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)
         present_wnmd_cancel_flip(window);
 
         present_execute_copy(vblank, crtc_msc);
+        assert(!vblank->queued);
 
-        if (vblank->queued) {
-            xorg_list_add(&vblank->event_queue, &window_priv->exec_queue);
+        if (present_wnmd_queue_vblank(screen, window, vblank->crtc,
+                                      vblank->event_id, crtc_msc + 1)
+            == Success) {
+            xorg_list_add(&vblank->event_queue, &window_priv->idle_queue);
             xorg_list_append(&vblank->window_list, &window_priv->vblank);
 
             return;
@@ -524,17 +516,6 @@ present_wnmd_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)
     }
 
     present_execute_post(vblank, ust, crtc_msc);
-}
-
-static int
-present_wnmd_queue_vblank(ScreenPtr screen,
-                             WindowPtr window,
-                             RRCrtcPtr crtc,
-                             uint64_t event_id,
-                             uint64_t msc)
-{
-    present_screen_priv_ptr screen_priv = present_screen_priv(screen);
-    return (*screen_priv->wnmd_info->queue_vblank) (window, crtc, event_id, msc);
 }
 
 static void
@@ -645,15 +626,20 @@ present_wnmd_pixmap(WindowPtr window,
                                    &screen_priv->wnmd_info->capabilities,
                                    notifies,
                                    num_notifies,
-                                   &target_msc,
+                                   target_msc,
                                    crtc_msc);
     if (!vblank)
         return BadAlloc;
 
+    /* WNMD presentations always complete (at least) one frame after they
+     * are executed
+     */
+    vblank->exec_msc = vblank->target_msc - 1;
+
     xorg_list_append(&vblank->event_queue, &window_priv->exec_queue);
     vblank->queued = TRUE;
-    if (crtc_msc < target_msc) {
-        if (present_wnmd_queue_vblank(screen, window, target_crtc, vblank->event_id, target_msc) == Success) {
+    if (crtc_msc < vblank->exec_msc) {
+        if (present_wnmd_queue_vblank(screen, window, target_crtc, vblank->event_id, vblank->exec_msc) == Success) {
             return Success;
         }
         DebugPresent(("present_queue_vblank failed\n"));
@@ -689,12 +675,6 @@ present_wnmd_abort_vblank(ScreenPtr screen, WindowPtr window, RRCrtcPtr crtc, ui
 }
 
 static void
-present_wnmd_flip_destroy(ScreenPtr screen)
-{
-    /* Cleanup done on window destruction */
-}
-
-static void
 present_wnmd_flush(WindowPtr window)
 {
     ScreenPtr               screen = window->drawable.pScreen;
@@ -711,7 +691,6 @@ present_wnmd_init_mode_hooks(present_screen_priv_ptr screen_priv)
 
     screen_priv->check_flip         =   &present_wnmd_check_flip;
     screen_priv->check_flip_window  =   &present_wnmd_check_flip_window;
-    screen_priv->can_window_flip    =   &present_wnmd_can_window_flip;
 
     screen_priv->present_pixmap     =   &present_wnmd_pixmap;
     screen_priv->create_event_id    =   &present_wnmd_create_event_id;
@@ -720,5 +699,4 @@ present_wnmd_init_mode_hooks(present_screen_priv_ptr screen_priv)
     screen_priv->re_execute         =   &present_wnmd_re_execute;
 
     screen_priv->abort_vblank       =   &present_wnmd_abort_vblank;
-    screen_priv->flip_destroy       =   &present_wnmd_flip_destroy;
 }

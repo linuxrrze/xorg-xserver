@@ -125,14 +125,19 @@ output_handle_mode(void *data, struct wl_output *wl_output, uint32_t flags,
     xwl_output->refresh = refresh;
 }
 
+/**
+ * Decides on the maximum expanse of an output in logical space (i.e. in the
+ * Wayland compositor plane) respective to some fix width and height values. The
+ * function sets the provided values to these maxima on return.
+ */
 static inline void
-output_get_new_size(struct xwl_output *xwl_output,
-                    Bool need_rotate,
-                    int *height, int *width)
+output_get_new_size(struct xwl_output *xwl_output, int *width, int *height)
 {
     int output_width, output_height;
 
-    if (!need_rotate || (xwl_output->rotation & (RR_Rotate_0 | RR_Rotate_180))) {
+    /* When we have xdg-output support the stored size is already rotated. */
+    if (xwl_output->xdg_output
+            || (xwl_output->rotation & (RR_Rotate_0 | RR_Rotate_180))) {
         output_width = xwl_output->width;
         output_height = xwl_output->height;
     } else {
@@ -498,17 +503,16 @@ apply_output_change(struct xwl_output *xwl_output)
     int mode_width, mode_height, count;
     int width = 0, height = 0, has_this_output = 0;
     RRModePtr *randr_modes;
-    Bool need_rotate;
 
     /* Clear out the "done" received flags */
     xwl_output->wl_output_done = FALSE;
     xwl_output->xdg_output_done = FALSE;
 
-    /* xdg-output sends output size in compositor space. so already rotated */
-    need_rotate = (xwl_output->xdg_output == NULL);
-
-    /* We need to rotate back the logical size for the mode */
-    if (!need_rotate || xwl_output->rotation & (RR_Rotate_0 | RR_Rotate_180)) {
+    /* When we have received an xdg-output for the mode size we might need to
+     * rotate back the stored logical size it provided.
+     */
+    if (xwl_output->xdg_output == NULL
+        || xwl_output->rotation & (RR_Rotate_0 | RR_Rotate_180)) {
         mode_width = xwl_output->width;
         mode_height = xwl_output->height;
     } else {
@@ -535,14 +539,14 @@ apply_output_change(struct xwl_output *xwl_output)
         if (it == xwl_output)
             has_this_output = 1;
 
-        output_get_new_size(it, need_rotate, &height, &width);
+        output_get_new_size(it, &width, &height);
     }
 
     if (!has_this_output) {
         xorg_list_append(&xwl_output->link, &xwl_screen->output_list);
 
         /* we did not check this output for new screen size, do it now */
-        output_get_new_size(xwl_output, need_rotate, &height, &width);
+        output_get_new_size(xwl_output, &width, &height);
 
 	--xwl_screen->expecting_event;
     }
@@ -704,12 +708,11 @@ xwl_output_remove(struct xwl_output *xwl_output)
     struct xwl_output *it;
     struct xwl_screen *xwl_screen = xwl_output->xwl_screen;
     int width = 0, height = 0;
-    Bool need_rotate = (xwl_output->xdg_output == NULL);
 
     xorg_list_del(&xwl_output->link);
 
     xorg_list_for_each_entry(it, &xwl_screen->output_list, link)
-        output_get_new_size(it, need_rotate, &height, &width);
+        output_get_new_size(it, &width, &height);
     update_screen_size(xwl_output, width, height);
 
     RRCrtcDestroy(xwl_output->randr_crtc);

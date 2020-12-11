@@ -1,6 +1,7 @@
 /*
  * Copyright 2008 Tungsten Graphics, Inc., Cedar Park, Texas.
  * Copyright 2011 Dave Airlie
+ * Copyright 2019 NVIDIA CORPORATION
  * All Rights Reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -26,6 +27,8 @@
  *
  * Original Author: Alan Hourihane <alanh@tungstengraphics.com>
  * Rewrite: Dave Airlie <airlied@redhat.com>
+ * Additional contributors:
+ *   Aaron Plattner <aplattner@nvidia.com>
  *
  */
 
@@ -80,6 +83,14 @@ static Bool ms_pci_probe(DriverPtr driver,
                          intptr_t match_data);
 static Bool ms_driver_func(ScrnInfoPtr scrn, xorgDriverFuncOp op, void *data);
 
+/* window wrapper functions used to get the notification when
+ * the window property changes */
+static Atom vrr_atom;
+static Bool property_vectors_wrapped;
+static Bool restore_property_vector;
+static int (*saved_change_property) (ClientPtr client);
+static int (*saved_delete_property) (ClientPtr client);
+
 #ifdef XSERVER_LIBPCIACCESS
 static const struct pci_id_match ms_device_match[] = {
     {
@@ -131,6 +142,8 @@ static const OptionInfoRec Options[] = {
     {OPTION_ZAPHOD_HEADS, "ZaphodHeads", OPTV_STRING, {0}, FALSE},
     {OPTION_DOUBLE_SHADOW, "DoubleShadow", OPTV_BOOLEAN, {0}, FALSE},
     {OPTION_ATOMIC, "Atomic", OPTV_BOOLEAN, {0}, FALSE},
+    {OPTION_VARIABLE_REFRESH, "VariableRefresh", OPTV_BOOLEAN, {0}, FALSE},
+    {OPTION_USE_GAMMA_LUT, "UseGammaLUT", OPTV_BOOLEAN, {0}, FALSE},
     {-1, NULL, OPTV_NONE, {0}, FALSE}
 };
 
@@ -703,7 +716,133 @@ msBlockHandler_oneshot(ScreenPtr pScreen, void *pTimeout)
 
     msBlockHandler(pScreen, pTimeout);
 
-    drmmode_set_desired_modes(pScrn, &ms->drmmode, TRUE);
+    drmmode_set_desired_modes(pScrn, &ms->drmmode, TRUE, FALSE);
+}
+
+Bool
+ms_window_has_variable_refresh(modesettingPtr ms, WindowPtr win) {
+	struct ms_vrr_priv *priv = dixLookupPrivate(&win->devPrivates, &ms->drmmode.vrrPrivateKeyRec);
+
+	return priv->variable_refresh;
+}
+
+static void
+ms_vrr_property_update(WindowPtr window, Bool variable_refresh)
+{
+    ScrnInfoPtr scrn = xf86ScreenToScrn(window->drawable.pScreen);
+    modesettingPtr ms = modesettingPTR(scrn);
+
+    struct ms_vrr_priv *priv = dixLookupPrivate(&window->devPrivates,
+                                                &ms->drmmode.vrrPrivateKeyRec);
+    priv->variable_refresh = variable_refresh;
+
+    if (ms->flip_window == window && ms->drmmode.present_flipping)
+        ms_present_set_screen_vrr(scrn, variable_refresh);
+}
+
+/* Wrapper for xserver/dix/property.c:ProcChangeProperty */
+static int
+ms_change_property(ClientPtr client)
+{
+    WindowPtr window = NULL;
+    int ret = 0;
+
+    REQUEST(xChangePropertyReq);
+
+    client->requestVector[X_ChangeProperty] = saved_change_property;
+    ret = saved_change_property(client);
+    if (ret != Success)
+        return ret;
+
+    if (restore_property_vector)
+        return ret;
+
+    client->requestVector[X_ChangeProperty] = ms_change_property;
+
+    ret = dixLookupWindow(&window, stuff->window, client, DixSetPropAccess);
+    if (ret != Success)
+        return ret;
+
+    // Checking for the VRR property change on the window
+    if (stuff->property == vrr_atom &&
+        xf86ScreenToScrn(window->drawable.pScreen)->PreInit == PreInit &&
+        stuff->format == 32 && stuff->nUnits == 1) {
+        uint32_t *value = (uint32_t *)(stuff + 1);
+        ms_vrr_property_update(window, *value != 0);
+    }
+
+    return ret;
+}
+
+/* Wrapper for xserver/dix/property.c:ProcDeleteProperty */
+static int
+ms_delete_property(ClientPtr client)
+{
+    WindowPtr window;
+    int ret;
+
+    REQUEST(xDeletePropertyReq);
+
+    client->requestVector[X_DeleteProperty] = saved_delete_property;
+    ret = saved_delete_property(client);
+
+    if (restore_property_vector)
+        return ret;
+
+    client->requestVector[X_DeleteProperty] = ms_delete_property;
+
+    if (ret != Success)
+        return ret;
+
+    ret = dixLookupWindow(&window, stuff->window, client, DixSetPropAccess);
+    if (ret != Success)
+        return ret;
+
+    if (stuff->property == vrr_atom &&
+        xf86ScreenToScrn(window->drawable.pScreen)->PreInit == PreInit)
+        ms_vrr_property_update(window, FALSE);
+
+    return ret;
+}
+
+static void
+ms_unwrap_property_requests(ScrnInfoPtr scrn)
+{
+    int i;
+
+    if (!property_vectors_wrapped)
+        return;
+
+    if (ProcVector[X_ChangeProperty] == ms_change_property)
+        ProcVector[X_ChangeProperty] = saved_change_property;
+    else
+        restore_property_vector = TRUE;
+
+    if (ProcVector[X_DeleteProperty] == ms_delete_property)
+        ProcVector[X_DeleteProperty] = saved_delete_property;
+    else
+        restore_property_vector = TRUE;
+
+    for (i = 0; i < currentMaxClients; i++) {
+        if (clients[i]->requestVector[X_ChangeProperty] == ms_change_property) {
+            clients[i]->requestVector[X_ChangeProperty] = saved_change_property;
+        } else {
+            restore_property_vector = TRUE;
+        }
+
+        if (clients[i]->requestVector[X_DeleteProperty] == ms_delete_property) {
+            clients[i]->requestVector[X_DeleteProperty] = saved_delete_property;
+        } else {
+            restore_property_vector = TRUE;
+        }
+    }
+
+    if (restore_property_vector) {
+        xf86DrvMsg(scrn->scrnIndex, X_WARNING,
+                   "Couldn't unwrap some window property request vectors\n");
+    }
+
+    property_vectors_wrapped = FALSE;
 }
 
 static void
@@ -725,6 +864,7 @@ FreeRec(ScrnInfoPtr pScrn)
         ms_ent = ms_ent_priv(pScrn);
         ms_ent->fd_ref--;
         if (!ms_ent->fd_ref) {
+            ms_unwrap_property_requests(pScrn);
             if (ms->pEnt->location.type == BUS_PCI)
                 ret = drmClose(ms->fd);
             else
@@ -1053,6 +1193,13 @@ PreInit(ScrnInfoPtr pScrn, int flags)
                    ms->drmmode.shadow_enable ? "YES" : "NO");
 
         ms->drmmode.shadow_enable2 = msShouldDoubleShadow(pScrn, ms);
+    } else {
+        if (!pScrn->is_gpu) {
+            MessageType from = xf86GetOptValBool(ms->drmmode.Options, OPTION_VARIABLE_REFRESH,
+                                                 &ms->vrr_support) ? X_CONFIG : X_DEFAULT;
+            xf86DrvMsg(pScrn->scrnIndex, from, "VariableRefresh: %sabled\n",
+                       ms->vrr_support ? "en" : "dis");
+        }
     }
 
     ms->drmmode.pageflip =
@@ -1387,7 +1534,7 @@ CreateScreenResources(ScreenPtr pScreen)
     ret = pScreen->CreateScreenResources(pScreen);
     pScreen->CreateScreenResources = CreateScreenResources;
 
-    if (!drmmode_set_desired_modes(pScrn, &ms->drmmode, pScrn->is_gpu))
+    if (!drmmode_set_desired_modes(pScrn, &ms->drmmode, pScrn->is_gpu, FALSE))
         return FALSE;
 
     if (!drmmode_glamor_handle_new_screen_pixmap(&ms->drmmode))
@@ -1450,6 +1597,12 @@ CreateScreenResources(ScreenPtr pScreen)
 
         pScrPriv->rrStartFlippingPixmapTracking = msStartFlippingPixmapTracking;
     }
+
+    if (ms->vrr_support &&
+        !dixRegisterPrivateKey(&ms->drmmode.vrrPrivateKeyRec,
+                               PRIVATE_WINDOW,
+                               sizeof(struct ms_vrr_priv)))
+            return FALSE;
 
     return ret;
 }
@@ -1805,6 +1958,18 @@ ScreenInit(ScreenPtr pScreen, int argc, char **argv)
 
     pScrn->vtSema = TRUE;
 
+    if (ms->vrr_support) {
+        if (!property_vectors_wrapped) {
+            saved_change_property = ProcVector[X_ChangeProperty];
+            ProcVector[X_ChangeProperty] = ms_change_property;
+            saved_delete_property = ProcVector[X_DeleteProperty];
+            ProcVector[X_DeleteProperty] = ms_delete_property;
+            property_vectors_wrapped = TRUE;
+        }
+        vrr_atom = MakeAtom("_VARIABLE_REFRESH",
+                             strlen("_VARIABLE_REFRESH"), TRUE);
+    }
+
     return TRUE;
 }
 
@@ -1853,8 +2018,25 @@ EnterVT(ScrnInfoPtr pScrn)
 
     SetMaster(pScrn);
 
-    if (!drmmode_set_desired_modes(pScrn, &ms->drmmode, TRUE))
-        return FALSE;
+    drmmode_update_kms_state(&ms->drmmode);
+
+    /* allow not all modes to be set successfully since some events might have
+     * happened while not being master that could prevent the previous
+     * configuration from being re-applied.
+     */
+    if (!drmmode_set_desired_modes(pScrn, &ms->drmmode, TRUE, TRUE)) {
+        xf86DisableUnusedFunctions(pScrn);
+
+        /* TODO: check that at least one screen is on, to allow the user to fix
+         * their setup if all modeset failed...
+         */
+
+        /* Tell the desktop environment that something changed, so that they
+         * can hopefully correct the situation
+         */
+        RRSetChanged(xf86ScrnToScreen(pScrn));
+        RRTellChanged(xf86ScrnToScreen(pScrn));
+    }
 
     return TRUE;
 }

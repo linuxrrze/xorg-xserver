@@ -399,8 +399,16 @@ xwl_present_check_flip2(RRCrtcPtr crtc,
                         PresentFlipReason *reason)
 {
     struct xwl_window *xwl_window = xwl_window_from_window(present_window);
+    ScreenPtr screen = pixmap->drawable.pScreen;
 
     if (!xwl_window)
+        return FALSE;
+
+    /* Can't flip if the window pixmap doesn't match the xwl_window parent
+     * window's, e.g. because a client redirected this window or one of its
+     * parents.
+     */
+    if (screen->GetWindowPixmap(xwl_window->window) != screen->GetWindowPixmap(present_window))
         return FALSE;
 
     /*
@@ -532,10 +540,7 @@ xwl_present_init(ScreenPtr screen)
 {
     struct xwl_screen *xwl_screen = xwl_screen_get(screen);
 
-    /*
-     * doesn't work with the EGLStream backend.
-     */
-    if (xwl_screen->egl_backend == &xwl_screen->eglstream_backend)
+    if (!xwl_glamor_has_present_flip(xwl_screen))
         return FALSE;
 
     if (!dixRegisterPrivateKey(&xwl_present_window_private_key, PRIVATE_WINDOW, 0))

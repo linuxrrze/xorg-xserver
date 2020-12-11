@@ -89,7 +89,10 @@ ddxUseMsg(void)
     ErrorF("-initfd fd             add given fd as a listen socket for initialization clients\n");
     ErrorF("-listenfd fd           add given fd as a listen socket\n");
     ErrorF("-listen fd             deprecated, use \"-listenfd\" instead\n");
+#ifdef XWL_HAS_EGLSTREAM
     ErrorF("-eglstream             use eglstream backend for nvidia GPUs\n");
+#endif
+    ErrorF("-shm                   use shared memory for passing buffers\n");
     ErrorF("-version               show the server version and exit\n");
 }
 
@@ -133,8 +136,8 @@ ddxProcessArgument(int argc, char *argv[], int i)
         if (!isdigit(*argv[i + 1]))
             return 0;
 
-        LogMessage(X_WARNING, "Option \"-listen\" for file descriptors is deprecated\n"
-                              "Please use \"-listenfd\" instead.\n");
+        LogMessageVerb(X_WARNING, 0, "Option \"-listen\" for file descriptors is deprecated\n"
+                                     "Please use \"-listenfd\" instead.\n");
 
         xwl_add_listen_fd (argc, argv, i);
         return 2;

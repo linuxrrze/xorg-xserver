@@ -84,10 +84,6 @@ struct xwl_pixmap {
     struct wl_buffer *buffer;
     struct xwl_screen *xwl_screen;
 
-    /* The stream and associated resources have their own lifetime separate
-     * from the pixmap's */
-    int refcount;
-
     EGLStreamKHR stream;
     EGLSurface surface;
 };
@@ -281,9 +277,6 @@ xwl_eglstream_unref_pixmap_stream(struct xwl_pixmap *xwl_pixmap)
 {
     struct xwl_screen *xwl_screen = xwl_pixmap->xwl_screen;
 
-    if (--xwl_pixmap->refcount >= 1)
-        return;
-
     /* If we're using this stream in the current egl context, unbind it so the
      * driver doesn't keep it around until the next eglMakeCurrent()
      * don't have to keep it around until something else changes the surface
@@ -305,12 +298,32 @@ xwl_eglstream_unref_pixmap_stream(struct xwl_pixmap *xwl_pixmap)
     free(xwl_pixmap);
 }
 
+static void
+xwl_glamor_eglstream_del_pending_stream_cb(struct xwl_pixmap *xwl_pixmap)
+{
+    struct xwl_eglstream_private *xwl_eglstream =
+        xwl_eglstream_get(xwl_pixmap->xwl_screen);
+    struct xwl_eglstream_pending_stream *pending;
+
+    xorg_list_for_each_entry(pending,
+                             &xwl_eglstream->pending_streams, link) {
+        if (pending->xwl_pixmap == xwl_pixmap) {
+            wl_callback_destroy(pending->cb);
+            xwl_eglstream_window_set_pending(pending->window, NULL);
+            xorg_list_del(&pending->link);
+            free(pending);
+            break;
+        }
+    }
+}
+
 static Bool
 xwl_glamor_eglstream_destroy_pixmap(PixmapPtr pixmap)
 {
     struct xwl_pixmap *xwl_pixmap = xwl_pixmap_get(pixmap);
 
     if (xwl_pixmap && pixmap->refcnt == 1) {
+        xwl_glamor_eglstream_del_pending_stream_cb(xwl_pixmap);
         xwl_pixmap_del_buffer_release_cb(pixmap);
         xwl_eglstream_unref_pixmap_stream(xwl_pixmap);
     }
@@ -341,13 +354,6 @@ xwl_eglstream_set_window_pixmap(WindowPtr window, PixmapPtr pixmap)
          * useless
          */
         pending->is_valid = FALSE;
-
-        /* The compositor may still be using the stream, so we can't destroy
-         * it yet. We'll only have a guarantee that the stream is safe to
-         * destroy once we receive the pending wl_display_sync() for this
-         * stream
-         */
-        pending->xwl_pixmap->refcount++;
     }
 
     xwl_screen->screen->SetWindowPixmap = xwl_eglstream->SetWindowPixmap;
@@ -437,8 +443,8 @@ xwl_eglstream_consumer_ready_callback(void *data,
     DebugF("eglstream: win %d completes eglstream for pixmap %p, congrats!\n",
            pending->window->drawable.id, pending->pixmap);
 
-    xwl_eglstream_window_set_pending(pending->window, NULL);
 out:
+    xwl_eglstream_window_set_pending(pending->window, NULL);
     xorg_list_del(&pending->link);
     free(pending);
 }
@@ -479,16 +485,14 @@ xwl_eglstream_queue_pending_stream(struct xwl_screen *xwl_screen,
 }
 
 static void
-xwl_eglstream_buffer_release_callback(void *data, struct wl_buffer *wl_buffer)
+xwl_eglstream_buffer_release_callback(void *data)
 {
-    struct xwl_pixmap *xwl_pixmap = xwl_pixmap_get(data);
-
-    xwl_pixmap_buffer_release_cb(data, wl_buffer);
-    xwl_eglstream_unref_pixmap_stream(xwl_pixmap);
+    /* drop the reference we took in post_damage, freeing if necessary */
+    dixDestroyPixmap(data, 0);
 }
 
 static const struct wl_buffer_listener xwl_eglstream_buffer_release_listener = {
-    xwl_eglstream_buffer_release_callback
+    xwl_pixmap_buffer_release_cb,
 };
 
 static void
@@ -510,7 +514,6 @@ xwl_eglstream_create_pending_stream(struct xwl_screen *xwl_screen,
     xwl_glamor_egl_make_current(xwl_screen);
 
     xwl_pixmap->xwl_screen = xwl_screen;
-    xwl_pixmap->refcount = 1;
     xwl_pixmap->stream = eglCreateStreamKHR(xwl_screen->egl_display, NULL);
     stream_fd = eglGetStreamFileDescriptorKHR(xwl_screen->egl_display,
                                               xwl_pixmap->stream);
@@ -527,6 +530,10 @@ xwl_eglstream_create_pending_stream(struct xwl_screen *xwl_screen,
     wl_buffer_add_listener(xwl_pixmap->buffer,
                            &xwl_eglstream_buffer_release_listener,
                            pixmap);
+
+    xwl_pixmap_set_buffer_release_cb(pixmap,
+                                     xwl_eglstream_buffer_release_callback,
+                                     pixmap);
 
     wl_eglstream_controller_attach_eglstream_consumer(
         xwl_eglstream->controller, xwl_window->surface, xwl_pixmap->buffer);
@@ -624,9 +631,8 @@ xwl_glamor_eglstream_post_damage(struct xwl_window *xwl_window,
     glBindVertexArray(saved_vao);
     glBindTexture(GL_TEXTURE_2D, 0);
 
-    /* After this we will hand off the eglstream's wl_buffer to the
-     * compositor, which will own it until it sends a release() event. */
-    xwl_pixmap->refcount++;
+    /* hang onto the pixmap until the compositor has released it */
+    pixmap->refcnt++;
 }
 
 static void
@@ -939,4 +945,5 @@ xwl_glamor_init_eglstream(struct xwl_screen *xwl_screen)
     xwl_screen->eglstream_backend.post_damage = xwl_glamor_eglstream_post_damage;
     xwl_screen->eglstream_backend.allow_commits = xwl_glamor_eglstream_allow_commits;
     xwl_screen->eglstream_backend.is_available = TRUE;
+    xwl_screen->eglstream_backend.backend_flags = XWL_EGL_BACKEND_NO_FLAG;
 }
